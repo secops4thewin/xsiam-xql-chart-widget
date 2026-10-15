@@ -1,0 +1,632 @@
+args:
+- auto: PREDEFINED
+  defaultValue: line
+  description: 'The chart to build. Can be "line", "pie", "column", "number", or "raw".
+    Use "raw" in the playground to see the query results as a table and check field
+    names. Default is "line".'
+  name: chart_type
+  predefined:
+  - line
+  - pie
+  - column
+  - number
+  - raw
+- defaultValue: dataset = cases | bin _time span = 1d | comp count() as count by _time
+  description: 'The XQL query to run. It must include a "comp" stage that names its
+    result to match value_field, e.g. "comp count() as count by _time". Line and column
+    charts also need "bin _time span = 1d". Do not set the time range in the query;
+    use time_frame instead. If the query has no limit stage, "| limit 1000" is added.'
+  name: query
+- defaultValue: 90 days
+  description: 'The time range to search, counted back from now. Use a number and a
+    unit, e.g. "10 days", "30 days", "90 days", "12 hours", or "2 weeks". For an exact
+    range, use "between 2026-01-01T00:00:00Z and 2026-04-01T00:00:00Z". Default is
+    "90 days".'
+  name: time_frame
+- defaultValue: _time
+  description: The field used for the X axis of line and column charts. It must be
+    in the "by" list of the comp stage. Default is "_time".
+  name: x_field
+- defaultValue: count
+  description: The numeric field to plot. It must match the "as" name in the comp
+    stage. Default is "count".
+  name: value_field
+- description: 'The field that splits a line or column chart into one series per value,
+    e.g. "severity". It must also be in the "by" list of the comp stage. Leave empty
+    for a single series.'
+  name: series_field
+- description: 'The field used for pie slices, e.g. "status". It must be in the "by"
+    list of the comp stage. Leave empty to group the X axis values by month.'
+  name: category_field
+- description: 'The format of the X axis labels, in Python strftime format, e.g. "%Y-%m-%d"
+    or "%d %b". Leave empty to choose automatically from the bin span ("%Y-%m-%d" for
+    days and weeks, "%Y-%m-%d %H:00" for hours).'
+  name: date_format
+- auto: PREDEFINED
+  defaultValue: 'true'
+  description: Set to true to add zero values for time buckets with no results, so
+    the line covers the whole time_frame at the bin span of the query. Set to false
+    to plot only the buckets returned by the query. Default is true.
+  name: fill_missing_days
+  predefined:
+  - 'true'
+  - 'false'
+- auto: PREDEFINED
+  defaultValue: 'true'
+  description: Set to true to check the query for missing or misspelled stages before
+    running it. Set to false to skip the check for advanced queries the check does
+    not understand. Default is true.
+  name: validate_query
+  predefined:
+  - 'true'
+  - 'false'
+- auto: PREDEFINED
+  defaultValue: docs
+  description: 'The format of the returned entry. Can be "docs" (the format from the
+    XSIAM script-based widget documentation) or "widget" (the widget entry format used
+    by XQLDSHelper). Default is "docs".'
+  name: output_style
+  predefined:
+  - docs
+  - widget
+- defaultValue: '10'
+  description: The number of seconds to wait between checks for query results. Default
+    is 10.
+  name: polling_interval
+- defaultValue: '120'
+  description: The maximum number of seconds to wait for the query to finish. Raise
+    to 180-240 for queries over 30 days. Default is 120.
+  name: query_timeout_duration
+- description: The name of the XQL Query Engine integration instance to use. Leave
+    empty to use the default instance.
+  name: xql_query_instance
+commonfields:
+  id: XQLChartWidget
+  version: -1
+comment: Runs an XQL query over a time frame (default 90 days) and returns line, pie,
+  column, or number data for a dashboard script widget. Requires the XQL Query Engine
+  integration. Full documentation at https://github.com/secops4thewin/xsiam-xql-chart-widget/blob/main/XQLChartWidget_README.md
+dockerimage: demisto/python3:3.12.13.10116658
+enabled: true
+name: XQLChartWidget
+runas: DBotWeakRole
+runonce: false
+script: |
+  import re
+  import json
+  import math
+  import time
+  import difflib
+  import traceback
+  from collections import defaultdict
+  from collections.abc import Iterable
+  from datetime import datetime, timedelta, timezone
+
+  import dateparser
+
+
+  DEFAULT_QUERY = "dataset = cases | bin _time span = 1d | comp count() as count by _time"
+  DEFAULT_TIME_FRAME = "90 days"
+  DEFAULT_POLLING_INTERVAL = 10  # in seconds
+  DEFAULT_QUERY_TIMEOUT_DURATION = 120  # in seconds
+  DEFAULT_RETRY_INTERVAL = 10  # in seconds
+  DEFAULT_RETRY_MAX = 5
+  DEFAULT_LIMIT = 1000
+  MAX_FILL_POINTS = 2000
+  QUERY_NAME = "XQLChartWidget"
+  README_URL = "https://github.com/secops4thewin/xsiam-xql-chart-widget/blob/main/XQLChartWidget_README.md#core-requirements-read-this-first"
+  README_HINT = f"See 'Core requirements' in the XQLChartWidget README: {README_URL}"
+  PARALLEL_LIMIT_ERRORS = (
+      "reached max allowed amount of parallel running queries",
+      "maximum allowed number of parallel running queries has been reached",
+  )
+
+  CHART_TYPES = ("line", "pie", "column", "number", "raw")
+  OUTPUT_STYLES = ("docs", "widget")
+  BOOLEANS = ("true", "false")
+  # Widget entry formats used by output_style=widget
+  WIDGET_FORMATS = {"line": "line", "pie": "pie", "column": "bar"}
+
+  TIME_UNITS = {"minute": timedelta(minutes=1), "hour": timedelta(hours=1), "day": timedelta(days=1),
+                "week": timedelta(weeks=1), "month": timedelta(days=30), "year": timedelta(days=365)}
+  TIME_UNIT_ALIASES = {"d": "day", "h": "hour", "w": "week", "min": "minute", "mins": "minute", "hr": "hour", "hrs": "hour"}
+  # Bin span units that can be gap-filled, and the default label format for each
+  SPAN_STEPS = {"m": timedelta(minutes=1), "h": timedelta(hours=1), "d": timedelta(days=1), "w": timedelta(weeks=1)}
+  SPAN_DATE_FORMATS = {"m": "%Y-%m-%d %H:%M", "h": "%Y-%m-%d %H:00"}
+  # Only used to suggest fixes for misspelled stages; stages not listed here are passed through
+  KNOWN_STAGES = (
+      "dataset", "preset", "datamodel", "config", "filter", "fields", "alter", "comp", "bin", "sort", "limit",
+      "dedup", "join", "union", "arrayexpand", "view", "target", "call", "top", "windowcomp", "transaction",
+      "iploc", "replacenull", "tag", "getrole", "cold_dataset", "pivot", "search",
+  )
+  SOURCE_STAGES = ("dataset", "cold_dataset", "preset", "datamodel", "config")
+
+
+  def to_float(val: Any) -> float | int:
+      """Ensure the value is of type number (float or int)."""
+      if val is None:
+          return 0
+      try:
+          val = float(val)
+          return int(val) if val.is_integer() else val
+      except (ValueError, TypeError):
+          return 0
+
+
+  def did_you_mean(value: Any, options: Iterable[Any], cutoff: float = 0.6) -> str:
+      """Return ' Did you mean 'x'?' for the closest option (case-insensitive), or ''."""
+      lowered = {str(o).lower(): str(o) for o in options}
+      match = difflib.get_close_matches(str(value).lower(), list(lowered), n=1, cutoff=cutoff)
+      return f" Did you mean '{lowered[match[0]]}'?" if match else ""
+
+
+  def parse_choice(args: dict[str, Any], name: str, options: tuple[str, ...], default: str) -> str:
+      value = str(args.get(name) or default).strip().lower()
+      if value not in options:
+          raise DemistoException(
+              f"Unsupported {name} '{args.get(name)}'.{did_you_mean(value, options)} Can be: {', '.join(options)}."
+          )
+      return value
+
+
+  def parse_time(val: Any) -> datetime | None:
+      """Convert an XQL time value (epoch s/ms, ISO or date string) to a UTC datetime."""
+      if val is None or val == "":
+          return None
+      if isinstance(val, (int, float)) or (isinstance(val, str) and re.fullmatch(r"\d+(\.\d+)?", val)):
+          ts = float(val)
+          if ts > 1e11:  # epoch milliseconds
+              ts /= 1000
+          return datetime.fromtimestamp(ts, tz=timezone.utc)
+      if isinstance(val, str):
+          try:
+              dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+          except ValueError:
+              dt = dateparser.parse(val, settings={"TIMEZONE": "UTC", "RETURN_AS_TIMEZONE_AWARE": True})
+          if dt:
+              return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+      return None
+
+
+  def normalize_time_frame(time_frame: str | None) -> str:
+      """Validate time_frame and fix safe typos, e.g. '30day' -> '30 days', '90 dyas' -> '90 days'."""
+      raw = (time_frame or DEFAULT_TIME_FRAME).strip()
+      if raw.lower().startswith("between "):
+          return raw
+      example = "Use a number and a unit, e.g. '10 days', '30 days', '90 days', or 'between <ISO time> and <ISO time>'."
+      m = re.fullmatch(r"(\d+)\s*([A-Za-z]+)", raw)
+      if not m:
+          raise DemistoException(f"Invalid time_frame '{time_frame}'. {example}")
+      amount, unit = int(m.group(1)), m.group(2).lower()
+      unit = TIME_UNIT_ALIASES.get(unit, unit)
+      if unit not in TIME_UNITS and unit.rstrip("s") in TIME_UNITS:
+          unit = unit.rstrip("s")
+      if unit not in TIME_UNITS:
+          options = list(TIME_UNITS) + [f"{u}s" for u in TIME_UNITS]
+          match = difflib.get_close_matches(unit, options, n=1, cutoff=0.6)
+          if not match:
+              raise DemistoException(f"Invalid time_frame unit '{m.group(2)}' in '{time_frame}'. {example}")
+          unit = match[0].rstrip("s")
+      normalized = f"{amount} {unit}{'' if amount == 1 else 's'}"
+      if normalized != raw:
+          demisto.debug(f"XQLChartWidget: time_frame '{raw}' normalized to '{normalized}'")
+      return normalized
+
+
+  def time_frame_range(time_frame: str) -> tuple[datetime, datetime] | None:
+      """Return (start, end) of a normalized time_frame, or None if it can't be worked out."""
+      if m := re.fullmatch(r"between\s+(.+?)\s+and\s+(.+)", time_frame, re.IGNORECASE):
+          start, end = parse_time(m.group(1)), parse_time(m.group(2))
+          return (start, end) if start and end else None
+      if m := re.fullmatch(r"(\d+) (\w+?)s?", time_frame):
+          if (unit := TIME_UNITS.get(m.group(2))) is not None:
+              now = datetime.now(timezone.utc)
+              return now - int(m.group(1)) * unit, now
+      return None
+
+
+  def ensure_limit(query: str) -> str:
+      if re.search(r"\|\s*limit\s+\d+", query, re.IGNORECASE):
+          return query
+      return f"{query.rstrip()} | limit {DEFAULT_LIMIT}"
+
+
+  class QueryInfo:
+      """
+      The parts of an XQL query that the widget depends on.
+      """
+
+      def __init__(self, query: str) -> None:
+          self.stages = [s.strip() for s in query.split("|") if s.strip()]
+          self.bins: list[tuple[str, str]] = []  # (field, span)
+          self.comp_aliases: list[str] = []
+          self.comp_by: list[str] = []
+          self.has_comp = False
+
+          for stage in self.stages:
+              if m := re.fullmatch(r"bin\s+(\S+)\s+span\s*=\s*(\S+).*", stage, re.IGNORECASE | re.DOTALL):
+                  self.bins.append((m.group(1), m.group(2)))
+              elif re.match(r"comp\b", stage, re.IGNORECASE):
+                  self.has_comp = True
+                  m = re.match(r"(.*?)\bby\b(.*)", stage, re.IGNORECASE | re.DOTALL)
+                  body, by = (m.group(1), m.group(2)) if m else (stage, "")
+                  self.comp_aliases = re.findall(r"\bas\s+([A-Za-z_]\w*)", body, re.IGNORECASE)
+                  self.comp_by = [part.split()[0] for part in by.split(",") if part.strip()]
+
+      def span(self, field: str) -> tuple[int, str] | None:
+          """Return (amount, unit) of the bin span on `field`, e.g. (1, 'd')."""
+          for bin_field, span in self.bins:
+              if bin_field == field and (m := re.fullmatch(r"(\d+)(ms|mo|s|m|h|d|w|y)", span.lower())):
+                  return int(m.group(1)), m.group(2)
+          return None
+
+
+  def check_query(query: str, chart_type: str, cfg: "WidgetConfig") -> None:
+      """Raise a clear error if the query is missing a stage the chart needs, or a stage looks misspelled."""
+      info = QueryInfo(query)
+
+      for stage in info.stages:
+          word = (re.match(r"[A-Za-z_]+", stage) or [""])[0].lower()
+          if word and word not in KNOWN_STAGES and (hint := did_you_mean(word, KNOWN_STAGES, cutoff=0.75)):
+              raise DemistoException(f"Unknown query stage '{word}' in '{stage}'.{hint} {README_HINT}")
+
+      first = (re.match(r"[A-Za-z_]+", info.stages[0]) or [""])[0].lower() if info.stages else ""
+      if first not in SOURCE_STAGES:
+          raise DemistoException(f"The query must start with 'dataset = <name>' (or preset/datamodel). {README_HINT}")
+
+      for stage in info.stages:
+          if re.match(r"bin\b", stage, re.IGNORECASE) and not re.fullmatch(r"bin\s+\S+\s+span\s*=\s*\S+.*", stage, re.IGNORECASE | re.DOTALL):
+              raise DemistoException(f"Invalid bin stage '{stage}'. Use e.g. 'bin _time span = 1d'. {README_HINT}")
+      for field, span in info.bins:
+          if not re.fullmatch(r"\d+(ms|mo|s|m|h|d|w|y)", span.lower()):
+              raise DemistoException(
+                  f"Invalid bin span '{span}'. Use a number and a unit: m, h, d, or w, e.g. 'span = 1d'. {README_HINT}"
+              )
+          if field not in (cfg.x_field, "_time") and (hint := did_you_mean(field, [cfg.x_field, "_time"])):
+              raise DemistoException(f"The bin stage uses field '{field}'.{hint} {README_HINT}")
+
+      if not info.has_comp:
+          raise DemistoException(
+              f"The query has no 'comp' stage. Add one that names its result '{cfg.value_field}', "
+              f"e.g. '| comp count() as {cfg.value_field} by _time'. {README_HINT}"
+          )
+      if cfg.value_field not in info.comp_aliases:
+          if info.comp_aliases:
+              raise DemistoException(
+                  f"The comp stage names its result {', '.join(repr(a) for a in info.comp_aliases)} but value_field is "
+                  f"'{cfg.value_field}'.{did_you_mean(cfg.value_field, info.comp_aliases)} Change the comp stage to "
+                  f"'as {cfg.value_field}' or set value_field={info.comp_aliases[0]}. {README_HINT}"
+              )
+          raise DemistoException(
+              f"The comp stage must name its result, e.g. 'comp count() as {cfg.value_field}'. {README_HINT}"
+          )
+
+      def require_by(field: str, arg_name: str) -> None:
+          if field not in info.comp_by:
+              by = f" The comp stage groups by: {', '.join(info.comp_by)}." if info.comp_by else ""
+              raise DemistoException(
+                  f"{arg_name} '{field}' is not in the 'by' list of the comp stage.{did_you_mean(field, info.comp_by)}{by} "
+                  f"Add it, e.g. '| comp count() as {cfg.value_field} by {field}'. {README_HINT}"
+              )
+
+      if chart_type in ("line", "column"):
+          if cfg.x_field == "_time" and not info.bins:
+              raise DemistoException(
+                  f"Line and column charts need a 'bin _time span = 1d' stage before comp, so results are grouped by "
+                  f"day. {README_HINT}"
+              )
+          require_by(cfg.x_field, "x_field")
+          if cfg.series_field:
+              require_by(cfg.series_field, "series_field")
+      elif chart_type == "pie":
+          require_by(cfg.category_field or cfg.x_field, "category_field" if cfg.category_field else "x_field")
+
+
+  def check_fields(rows: list[dict[str, Any]], fields: list[tuple[str, str | None]]) -> None:
+      """Raise a clear error if a field arg is not in the query results (e.g. a spelling mistake)."""
+      available: dict[str, None] = {}
+      for row in rows[:50]:
+          available.update(dict.fromkeys(row))
+      for arg_name, field in fields:
+          if field and field not in available:
+              raise DemistoException(
+                  f"Field '{field}' ({arg_name}) not found in the XQL results.{did_you_mean(field, available)} "
+                  f"Available fields: {', '.join(available)}. Field names are case-sensitive."
+              )
+
+
+  class WidgetConfig:
+      """
+      Validated widget arguments.
+      """
+
+      def __init__(self, args: dict[str, Any]) -> None:
+          self.chart_type = parse_choice(args, "chart_type", CHART_TYPES, "line")
+          self.output_style = parse_choice(args, "output_style", OUTPUT_STYLES, "docs")
+          self.fill_missing_days = parse_choice(args, "fill_missing_days", BOOLEANS, "true") == "true"
+          self.validate_query = parse_choice(args, "validate_query", BOOLEANS, "true") == "true"
+          self.query = (args.get("query") or DEFAULT_QUERY).strip()
+          self.time_frame = normalize_time_frame(args.get("time_frame"))
+          self.x_field = (args.get("x_field") or "_time").strip()
+          self.value_field = (args.get("value_field") or "count").strip()
+          self.series_field = (args.get("series_field") or "").strip() or None
+          self.category_field = (args.get("category_field") or "").strip() or None
+          self.span = QueryInfo(self.query).span(self.x_field)
+          self.date_format = args.get("date_format") or SPAN_DATE_FORMATS.get(self.span[1] if self.span else "", "%Y-%m-%d")
+          self.polling_interval = arg_to_number(args.get("polling_interval")) or DEFAULT_POLLING_INTERVAL
+          self.query_timeout_duration = arg_to_number(args.get("query_timeout_duration")) or DEFAULT_QUERY_TIMEOUT_DURATION
+          self.xql_query_instance = args.get("xql_query_instance") or None
+
+      def chart_fields(self) -> list[tuple[str, str | None]]:
+          """The (arg name, field) pairs the chart reads from each row."""
+          if self.chart_type in ("line", "column"):
+              return [("x_field", self.x_field), ("value_field", self.value_field), ("series_field", self.series_field)]
+          if self.chart_type == "pie":
+              category = ("category_field", self.category_field) if self.category_field else ("x_field", self.x_field)
+              return [category, ("value_field", self.value_field)]
+          if self.chart_type == "number":
+              return [("value_field", self.value_field)]
+          return []
+
+
+  class XQLQuery:
+      """
+      Executes an XQL query through the XQL Query Engine integration and polls for results.
+      """
+
+      @staticmethod
+      def __peek_response(res: list[dict[str, Any]]) -> dict | None:
+          for ent in res or []:
+              ec = ent.get("EntryContext") or {}
+              for k, v in ec.items():
+                  k, _, _ = k.partition("(")
+                  if k == "PaloAltoNetworksXQL.GenericQuery" and isinstance(v, dict):
+                      return v
+          return None
+
+      @staticmethod
+      def __get_error_message(res: list[dict[str, Any]]) -> str | None:
+          if XQLQuery.__peek_response(res) is not None:
+              return None
+          if is_error(res):
+              if message := get_error(res):
+                  return message
+          for ent in res or []:
+              if message := ent.get("HumanReadable"):
+                  return message
+          return f"Unable to get query results - {res}"
+
+      def __init__(
+          self,
+          xql_query_instance: str | None = None,
+          polling_interval: int = DEFAULT_POLLING_INTERVAL,
+          query_timeout_duration: int = DEFAULT_QUERY_TIMEOUT_DURATION,
+          retry_interval: int = DEFAULT_RETRY_INTERVAL,
+          retry_max: int = DEFAULT_RETRY_MAX,
+      ) -> None:
+          self.__instance = xql_query_instance
+          self.__polling_interval = max(polling_interval, 1)
+          self.__query_timeout_duration = max(query_timeout_duration, 0)
+          self.__retry_interval = retry_interval
+          self.__retry_max = max(retry_max, 0)
+
+      def query(self, query: str, time_frame: str) -> list[dict[str, Any]]:
+          demisto.debug(f"Run XQL: {time_frame}: {query}")
+
+          # Start the query, retrying while the tenant is at its parallel query limit
+          for retry_count in range(self.__retry_max + 1):
+              res = demisto.executeCommand(
+                  "xdr-xql-generic-query",
+                  assign_params(
+                      query_name=QUERY_NAME,
+                      query=query,
+                      time_frame=time_frame,
+                      parse_result_file_to_context="true",
+                      using=self.__instance,
+                  ),
+              )
+              error_message = self.__get_error_message(res)
+              if error_message is None:
+                  break
+              if retry_count >= self.__retry_max or all(x not in error_message for x in PARALLEL_LIMIT_ERRORS):
+                  raise DemistoException(
+                      f"Failed to execute xdr-xql-generic-query. Error details:\n{error_message}\n{README_HINT}"
+                  )
+              time.sleep(self.__retry_interval)
+
+          response = self.__peek_response(res) or {}
+          execution_id = response.get("execution_id")
+          if not execution_id:
+              raise DemistoException(f"No execution_id in the response - {response}")
+
+          # Poll until the query completes
+          timeout_time = time.time() + self.__query_timeout_duration
+          while True:
+              status = response.get("status", "")
+              if status in ("SUCCESS", "PARTIAL_SUCCESS"):
+                  return response.get("results") or []
+              if status != "PENDING":
+                  raise DemistoException(f"Failed to get query results - {response}\n{README_HINT}")
+
+              remaining_time = timeout_time - time.time()
+              if remaining_time <= 0:
+                  raise DemistoException(
+                      f"Unable to get query results within {self.__query_timeout_duration} seconds. "
+                      f"Raise query_timeout_duration or use a shorter time_frame."
+                  )
+              time.sleep(min(remaining_time, self.__polling_interval))
+
+              res = demisto.executeCommand(
+                  "xdr-xql-get-query-results",
+                  assign_params(
+                      query_id=execution_id,
+                      parse_result_file_to_context="true",
+                      using=self.__instance,
+                  ),
+              )
+              if is_error(res):
+                  raise DemistoException(f"Failed to execute xdr-xql-get-query-results. Error details:\n{get_error(res)}")
+              response = self.__peek_response(res)
+              if response is None:
+                  raise DemistoException(f"Unable to get query results - {res}")
+
+
+  class ChartBuilder:
+      """
+      Converts XQL rows into widget data points: [{"name": str, "data": [number], "groups": [...]}]
+      """
+
+      def __init__(self, cfg: WidgetConfig) -> None:
+          self.cfg = cfg
+
+      def __label(self, val: Any, date_format: str) -> tuple[str, str]:
+          """Return (sort key, label) for an X axis value."""
+          if dt := parse_time(val):
+              return dt.strftime("%Y%m%d%H%M%S"), dt.strftime(date_format)
+          label = "" if val is None else str(val)
+          return label, label
+
+      def __fill_times(self, times: list[datetime]) -> list[datetime]:
+          """Return every bucket time between the time_frame start and end, at the bin span of the query."""
+          if not self.cfg.span or self.cfg.span[1] not in SPAN_STEPS:
+              return []
+          step = self.cfg.span[0] * SPAN_STEPS[self.cfg.span[1]]
+          if bounds := time_frame_range(self.cfg.time_frame):
+              start, end = bounds
+          elif times:
+              start, end = min(times), max(times)
+          else:
+              return []
+
+          # Anchor on a real bucket so filled buckets line up with the ones XQL returned
+          if times:
+              anchor = min(times)
+          else:
+              anchor = start.replace(second=0, microsecond=0)
+              if self.cfg.span[1] in ("d", "w"):
+                  anchor = anchor.replace(hour=0, minute=0)
+              elif self.cfg.span[1] == "h":
+                  anchor = anchor.replace(minute=0)
+          first = anchor - math.ceil((anchor - start) / step) * step if anchor > start else anchor
+
+          filled = []
+          current = first
+          while current <= end and len(filled) < MAX_FILL_POINTS:
+              filled.append(current)
+              current += step
+          return filled
+
+      def __series_points(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+          cfg = self.cfg
+          buckets: dict[str, dict[str, float]] = {}
+          sort_keys: dict[str, str] = {}
+          series_names: dict[str, None] = {}
+
+          for row in rows:
+              sort_key, label = self.__label(row.get(cfg.x_field), cfg.date_format)
+              series = str(row.get(cfg.series_field)) if cfg.series_field else ""
+              series_names[series] = None
+              buckets.setdefault(label, defaultdict(float))[series] += to_float(row.get(cfg.value_field))
+              sort_keys[label] = min(sort_keys.get(label, sort_key), sort_key)
+
+          if cfg.fill_missing_days:
+              times = [t for t in (parse_time(r.get(cfg.x_field)) for r in rows) if t]
+              if times or not rows:
+                  for t in self.__fill_times(times):
+                      label = t.strftime(cfg.date_format)
+                      if label not in buckets:
+                          buckets[label] = defaultdict(float)
+                          sort_keys[label] = t.strftime("%Y%m%d%H%M%S")
+
+          points = []
+          for label in sorted(buckets, key=lambda k: sort_keys[k]):
+              bucket = buckets[label]
+              point = {"name": label, "data": [to_float(sum(bucket.values()))], "groups": []}
+              if cfg.series_field:
+                  point["groups"] = [{"name": s, "data": [to_float(bucket.get(s, 0))]} for s in series_names]
+              points.append(point)
+          return points
+
+      def line(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+          return self.__series_points(rows)
+
+      def column(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+          return self.__series_points(rows)
+
+      def pie(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+          totals: dict[str, float] = defaultdict(float)
+          for row in rows:
+              if self.cfg.category_field:
+                  name = str(row.get(self.cfg.category_field))
+              else:
+                  _, name = self.__label(row.get(self.cfg.x_field), "%Y-%m")
+              totals[name] += to_float(row.get(self.cfg.value_field))
+          return [
+              {"name": name, "data": [to_float(value)], "groups": []}
+              for name, value in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+          ]
+
+      def number(self, rows: list[dict[str, Any]]) -> int | float:
+          return to_float(sum(to_float(row.get(self.cfg.value_field)) for row in rows))
+
+
+  # Add a new chart type by writing a ChartBuilder method and registering it here (and in CHART_TYPES).
+  CHART_BUILDERS = {
+      "line": ChartBuilder.line,
+      "pie": ChartBuilder.pie,
+      "column": ChartBuilder.column,
+      "number": ChartBuilder.number,
+  }
+
+
+  def build_entry(chart_type: str, data: Any, output_style: str) -> Any:
+      if output_style == "widget":
+          return {
+              "Type": EntryType.WIDGET,
+              "ContentsFormat": WIDGET_FORMATS.get(chart_type, "number"),
+              "Contents": {"stats": data},
+          }
+      if chart_type == "number":
+          return data
+      return {"Type": 1, "ContentsFormat": "json", "Contents": json.dumps(data)}
+
+
+  def main():
+      try:
+          cfg = WidgetConfig(demisto.args())
+          if cfg.validate_query and cfg.chart_type != "raw":
+              check_query(cfg.query, cfg.chart_type, cfg)
+
+          rows = XQLQuery(
+              xql_query_instance=cfg.xql_query_instance,
+              polling_interval=cfg.polling_interval,
+              query_timeout_duration=cfg.query_timeout_duration,
+          ).query(ensure_limit(cfg.query), cfg.time_frame)
+          demisto.debug(f"XQLChartWidget: {len(rows)} rows returned")
+
+          if cfg.chart_type == "raw":
+              return_results(CommandResults(readable_output=tableToMarkdown(f"XQL results ({len(rows)} rows)", rows)))
+              return
+
+          if rows:
+              check_fields(rows, cfg.chart_fields())
+          elif not (cfg.chart_type == "number" or (cfg.chart_type in ("line", "column") and cfg.fill_missing_days)):
+              raise DemistoException(
+                  f"The query returned 0 rows for time_frame '{cfg.time_frame}'. Try a longer time_frame, "
+                  f"or run with chart_type=raw to check the query."
+              )
+
+          data = CHART_BUILDERS[cfg.chart_type](ChartBuilder(cfg), rows)
+          return_results(build_entry(cfg.chart_type, data, cfg.output_style))
+      except Exception as e:
+          demisto.error(traceback.format_exc())
+          return_error(f"Failed to execute XQLChartWidget. Error: {str(e)}")
+
+
+  if __name__ in ("__main__", "__builtin__", "builtins"):
+      main()
+scripttarget: 0
+subtype: python3
+tags:
+- widget
+type: python

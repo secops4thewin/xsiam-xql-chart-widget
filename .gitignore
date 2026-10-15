@@ -1,0 +1,5 @@
+# Publish only the script and its README. Everything else (.env, tests, demisto-sdk) stays local.
+*
+!.gitignore
+!XQLChartWidget.yml
+!XQLChartWidget_README.md
