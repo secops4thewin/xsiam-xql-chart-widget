@@ -85,7 +85,7 @@ commonfields:
   version: -1
 comment: Runs an XQL query over a time frame (default 90 days) and returns line, pie,
   column, or number data for a dashboard script widget. Requires the XQL Query Engine
-  integration. Full documentation at https://github.com/secops4thewin/xsiam-xql-chart-widget/blob/main/XQLChartWidget_README.md
+  integration. Full documentation at https://github.com/secops4thewin/xsiam-xql-chart-widget
 dockerimage: demisto/python3:3.12.13.10116658
 enabled: true
 name: XQLChartWidget
@@ -114,7 +114,7 @@ script: |
   DEFAULT_LIMIT = 1000
   MAX_FILL_POINTS = 2000
   QUERY_NAME = "XQLChartWidget"
-  README_URL = "https://github.com/secops4thewin/xsiam-xql-chart-widget/blob/main/XQLChartWidget_README.md#core-requirements-read-this-first"
+  README_URL = "https://github.com/secops4thewin/xsiam-xql-chart-widget#core-requirements-read-this-first"
   README_HINT = f"See 'Core requirements' in the XQLChartWidget README: {README_URL}"
   PARALLEL_LIMIT_ERRORS = (
       "reached max allowed amount of parallel running queries",
